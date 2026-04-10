@@ -275,57 +275,79 @@ export async function deploy(options: SWACLIConfig) {
 
       spinner.start(`Preparing deployment. Please wait...`);
 
-      const child = spawn(binary, [], {
-        env: {
-          ...swaCLIEnv(cliEnv, deployClientEnv),
-        },
-      });
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(binary, [], {
+          env: {
+            ...swaCLIEnv(cliEnv, deployClientEnv),
+          },
+        });
 
-      let projectUrl = "";
-      child.stdout!.on("data", (data) => {
-        data
-          .toString()
-          .trim()
-          .split("\n")
-          .forEach((line: string) => {
-            if (line.includes("Exiting")) {
-              spinner.text = line;
-              spinner.stop();
-            } else if (line.includes("Visit your site at:")) {
-              projectUrl = line.match("http.*")?.pop()?.trim() as string;
-              line = "";
-            }
+        let settled = false;
+        const succeed = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        const fail = (err: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        };
 
-            // catch errors printed to stdout
-            else if (line.includes("[31m")) {
-              if (line.includes("Cannot deploy to the function app because Function language info isn't provided.")) {
-                line = chalk.red(
-                  `Cannot deploy to the function app because Function language info isn't provided, use flags "--api-language" and "--api-version" or add a "platform.apiRuntime" property to your staticwebapp.config.json file, or create one in ${options.outputLocation!}. Please consult the documentation for more information about staticwebapp.config.json: https://learn.microsoft.com/azure/static-web-apps/build-configuration?tabs=github-actions#skip-building-the-api`,
-                );
+        let projectUrl = "";
+        child.stdout!.on("data", (data) => {
+          data
+            .toString()
+            .trim()
+            .split("\n")
+            .forEach((line: string) => {
+              if (line.includes("Exiting")) {
+                spinner.text = line;
+                spinner.stop();
+              } else if (line.includes("Visit your site at:")) {
+                projectUrl = line.match("http.*")?.pop()?.trim() as string;
+                line = "";
               }
 
-              spinner.fail(chalk.red(line));
-            } else {
-              if (isVerboseEnabled || dryRun) {
-                spinner.info(line.trim());
+              // catch errors printed to stdout
+              else if (line.includes("[31m")) {
+                if (line.includes("Cannot deploy to the function app because Function language info isn't provided.")) {
+                  line = chalk.red(
+                    `Cannot deploy to the function app because Function language info isn't provided, use flags "--api-language" and "--api-version" or add a "platform.apiRuntime" property to your staticwebapp.config.json file, or create one in ${options.outputLocation!}. Please consult the documentation for more information about staticwebapp.config.json: https://learn.microsoft.com/azure/static-web-apps/build-configuration?tabs=github-actions#skip-building-the-api`,
+                  );
+                }
+
+                spinner.fail(chalk.red(line));
               } else {
-                spinner.text = line.trim();
+                if (isVerboseEnabled || dryRun) {
+                  spinner.info(line.trim());
+                } else {
+                  spinner.text = line.trim();
+                }
               }
-            }
-          });
-      });
+            });
+        });
 
-      child.on("error", (error) => {
-        logger.error(error.toString());
-      });
+        child.once("error", (error) => {
+          logger.error(error.toString());
+          fail(error);
+        });
 
-      child.on("close", (code) => {
-        cleanUp();
-
-        if (code === 0) {
-          spinner.succeed(chalk.green(`Project deployed to ${chalk.underline(projectUrl)} 🚀`));
-          logger.log(``);
-        }
+        child.once("close", (code, signal) => {
+          if (code === 0) {
+            spinner.succeed(chalk.green(`Project deployed to ${chalk.underline(projectUrl)} 🚀`));
+            logger.log(``);
+            succeed();
+          } else if (code !== null) {
+            const err = new Error(`Deploy client exited with code ${code}`);
+            spinner.fail(chalk.red(err.message));
+            fail(err);
+          } else {
+            const err = new Error(`Deploy client was killed by signal ${signal}`);
+            spinner.fail(chalk.red(err.message));
+            fail(err);
+          }
+        });
       });
     }
   } catch (error) {
@@ -336,6 +358,7 @@ export async function deploy(options: SWACLIConfig) {
       `For further information, please visit the Azure Static Web Apps documentation at https://docs.microsoft.com/azure/static-web-apps/`,
     );
     logGitHubIssueMessageAndExit();
+    throw error;
   } finally {
     cleanUp();
   }
